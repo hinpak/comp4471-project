@@ -46,4 +46,3 @@ Thumbs.db
 # Project specific
 *.log
 *.out
-uv.lock
