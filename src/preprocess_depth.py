@@ -1,34 +1,11 @@
 """
 preprocess_depth.py — Build the depth-map training tensor from SHREC 2017.
-
-Pipeline per clip:
-  1. Load all {i}_depth.png              →  (N, 480, 640)  raw uint16 values (mm)
-  2. Per-frame crop using bounding box   →  (N, H_crop, W_crop)  hand ROI only
-  3. Resize to (DEPTH_RESIZE, DEPTH_RESIZE)  →  (N, 64, 64)
-  4. Normalise depth: clip at DEPTH_MAX_MM, divide by DEPTH_MAX_MM  →  [0, 1]
-  5. Temporal windowing                  →  sliding windows (T=16, stride=4)
-  6. Augmentation (train only)
-  7. Save to .npz
-
-Output tensors:
-  X  — (M, T, 64, 64)   depth windows  (channel dim added when fed to CNN)
-  y  — (M,)             gesture label (0-indexed)
-
-WHY 64×64?
-  - The original 640×480 frame contains the FULL scene. The hand occupies a
-    small ROI (provided by general_informations.txt).  We crop that ROI first
-    so the network only sees the hand, then resize to 64×64.
-  - 64×64 keeps the per-sample memory footprint tiny while preserving the
-    spatial structure a lightweight 3D-CNN needs.  Going to 112×112 or 224×224
-    is valid but multiplies VRAM and training time ~3-12×.
-  - 64×64 matches the input resolution used in several published depth-based
-    gesture recognition works (e.g. NVIDIA gesture with R3D).
 """
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import List, Tuple  # ← Only here, once
 
 from config import (
     RAW_DIR, PROC_DIR, TRAIN_SPLIT_FILE, TEST_SPLIT_FILE,
@@ -37,7 +14,6 @@ from config import (
 )
 from shrec_io import (parse_manifest, iter_clips, load_depth_frames,
                       load_bboxes, COL_LABEL14)
-
 
 # ── Crop & resize helpers ────────────────────────────────────────────────────
 
@@ -55,7 +31,6 @@ def _expand_bbox(x: int, y: int, w: int, h: int,
     x2 = min(img_w, x + w + pad_x)
     y2 = min(img_h, y + h + pad_y)
     return x1, y1, x2, y2
-
 
 def crop_and_resize_frame(frame: np.ndarray, bbox_row: np.ndarray,
                            size: int = DEPTH_RESIZE) -> np.ndarray:
@@ -79,7 +54,6 @@ def crop_and_resize_frame(frame: np.ndarray, bbox_row: np.ndarray,
     resized  = crop_img.resize((size, size), Image.BILINEAR)
     return np.array(resized, dtype=np.float32) / 255.0      # back to [0, 1]
 
-
 def process_depth_clip(clip_path: Path, n_frames: int,
                         size: int = DEPTH_RESIZE) -> np.ndarray:
     """
@@ -101,7 +75,6 @@ def process_depth_clip(clip_path: Path, n_frames: int,
 
     return np.stack(processed, axis=0)    # (N, size, size)
 
-
 # ── Temporal windowing ───────────────────────────────────────────────────────
 
 def sliding_windows_depth(clip: np.ndarray, T: int = WINDOW_T,
@@ -120,7 +93,6 @@ def sliding_windows_depth(clip: np.ndarray, T: int = WINDOW_T,
     for start in range(0, N - T + 1, stride):
         windows.append(clip[start: start + T])
     return windows
-
 
 # ── Augmentation ─────────────────────────────────────────────────────────────
 
@@ -166,34 +138,41 @@ def augment_depth(window: np.ndarray,
         w[:, src_y1:src_y2, src_x1:src_x2]
     return canvas.astype(np.float32)
 
-
 # ── Main builder ─────────────────────────────────────────────────────────────
 
 def build_depth_split(manifest: np.ndarray, augment: bool = False,
                        n_aug: int = 3, label_col: int = COL_LABEL14,
-                       seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+                       seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     X_list, y_list = [], []
+    clip_ids = []
 
     for row, clip_path in tqdm(iter_clips(RAW_DIR, manifest),
                                 total=len(manifest), desc="clips"):
-        n_frames = int(row[6])           # COL_SEQ_LEN
-        depth_seq = process_depth_clip(clip_path, n_frames)  # (N, 64, 64)
+        n_frames = int(row[6])
+        depth_seq = process_depth_clip(clip_path, n_frames)
         label = int(row[label_col]) - 1
+        
+        # Encode clip ID
+        g, f, s, e = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        clip_id = g * 1000000 + f * 10000 + s * 100 + e
 
         for win in sliding_windows_depth(depth_seq):
             X_list.append(win)
             y_list.append(label)
+            clip_ids.append(clip_id)
 
             if augment:
                 for _ in range(n_aug):
                     X_list.append(augment_depth(win, rng))
                     y_list.append(label)
+                    clip_ids.append(clip_id)
 
-    X = np.stack(X_list, axis=0).astype(np.float32)   # (M, T, 64, 64)
+    X = np.stack(X_list, axis=0).astype(np.float32)
     y = np.array(y_list, dtype=np.int64)
-    return X, y
-
+    clip_ids = np.array(clip_ids, dtype=np.int64)
+    
+    return X, y, clip_ids
 
 def run(use_28_class: bool = False, n_aug: int = 3):
     PROC_DIR.mkdir(parents=True, exist_ok=True)
@@ -206,14 +185,18 @@ def run(use_28_class: bool = False, n_aug: int = 3):
     test_manifest  = parse_manifest(TEST_SPLIT_FILE)
 
     print("[1/3] Processing test split …")
-    X_test, y_test = build_depth_split(test_manifest, augment=False,
-                                        label_col=label_col)
-    np.savez_compressed(PROC_DEPTH_TEST, X=X_test, y=y_test)
-    print(f"  test  → X{X_test.shape}  y{y_test.shape}")
+    X_test, y_test, clip_ids_test = build_depth_split(
+        test_manifest, augment=False, label_col=label_col
+    )
+    np.savez_compressed(PROC_DEPTH_TEST, 
+                        X=X_test, y=y_test, clip_ids=clip_ids_test)
+    print(f"  test  → X{X_test.shape}  y{y_test.shape}  clip_ids{clip_ids_test.shape}")
 
     print("[2/3] Processing train split (with augmentation) …")
-    X_all, y_all = build_depth_split(train_manifest, augment=True,
-                                      n_aug=n_aug, label_col=label_col)
+    X_all, y_all, clip_ids_all = build_depth_split(
+        train_manifest, augment=True, n_aug=n_aug, label_col=label_col
+    )
+    print(f"  all   → X{X_all.shape}  y{y_all.shape}  clip_ids{clip_ids_all.shape}")
 
     print("[3/3] Stratified train/val split …")
     sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_FRAC,
@@ -221,13 +204,17 @@ def run(use_28_class: bool = False, n_aug: int = 3):
     train_idx, val_idx = next(sss.split(X_all, y_all))
 
     np.savez_compressed(PROC_DEPTH_TRAIN,
-                        X=X_all[train_idx], y=y_all[train_idx])
+                        X=X_all[train_idx], 
+                        y=y_all[train_idx],
+                        clip_ids=clip_ids_all[train_idx])
     np.savez_compressed(PROC_DEPTH_VAL,
-                        X=X_all[val_idx],   y=y_all[val_idx])
-    print(f"  train → X{X_all[train_idx].shape}  y{y_all[train_idx].shape}")
-    print(f"  val   → X{X_all[val_idx].shape}    y{y_all[val_idx].shape}")
+                        X=X_all[val_idx],   
+                        y=y_all[val_idx],
+                        clip_ids=clip_ids_all[val_idx])
+    
+    print(f"  train → X{X_all[train_idx].shape}  y{y_all[train_idx].shape}  clip_ids{clip_ids_all[train_idx].shape}")
+    print(f"  val   → X{X_all[val_idx].shape}    y{y_all[val_idx].shape}    clip_ids{clip_ids_all[val_idx].shape}")
     print("Done.")
-
 
 if __name__ == "__main__":
     run()
