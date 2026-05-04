@@ -1,0 +1,22 @@
+// OrbbecViewer Config for the ORBBEC Astra Pro RGB-D Camera for custom dataset collection
+
+Resolution=640x480
+Format=Y11
+FrameRate=30
+
+// Advanced Control
+Depth Valid Range=0 - 240mm
+DepthUnit=1.0 mm
+NoiseRemovalFilter=on
+- Min Diff=8553
+- Max Size=14
+
+// Visualization
+ColorMap=JetInv
+Preprocess=Dynamic
+Histogram Equalization=on
+- Visual range min=1
+- Visual range max=12000
+
+// Save Image
+num to be saved=90
