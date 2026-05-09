@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
   "matplotlib>=3.8",
+  "opencv-python-headless>=4.10",
   "scikit-learn>=1.4",
   "tqdm>=4.66",
   "jupyter>=1.0",
